@@ -3,3 +3,6 @@
 
 # local machine build config
 .cargo/config.toml
+
+# release staging
+/dist
