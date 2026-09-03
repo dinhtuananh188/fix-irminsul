@@ -4,9 +4,11 @@ use anime_game_data::{AnimeGameData, Property, SkillType};
 use anyhow::Result;
 pub use auto_artifactarium::Achievement;
 pub use auto_artifactarium::r#gen::protos::{AvatarInfo, Item};
+use chrono::Utc;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::DataCounts;
 use crate::good::{self, fake_uninitialized_4th_line};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +69,66 @@ impl PlayerData {
 
     pub fn process_items(&mut self, items: &[Item]) {
         self.items = items.into();
+    }
+
+    /// Counts of each exportable thing currently captured, for display in the
+    /// UI.  Unfiltered — this is "what the game sent", not "what would export".
+    pub fn counts(&self) -> DataCounts {
+        let mut counts = DataCounts {
+            characters: self
+                .characters
+                .iter()
+                .filter(|avatar| avatar.avatar_type == 1)
+                .count() as u32,
+            achievements: self.achievements.len() as u32,
+            ..DataCounts::default()
+        };
+        for item in &self.items {
+            if item.has_equip() {
+                let equip = item.equip();
+                if equip.has_reliquary() {
+                    counts.artifacts += 1;
+                } else if equip.has_weapon() {
+                    counts.weapons += 1;
+                }
+            } else if item.has_material() {
+                counts.materials += 1;
+            }
+        }
+        counts
+    }
+
+    /// Export achievements in the [UIAF](https://uigf.org/en/standards/uiaf.html)
+    /// format understood by Snap Hutao, cocogoat, paimon.moe and others.
+    pub fn export_uiaf(&self) -> Result<String> {
+        if self.achievements.is_empty() {
+            anyhow::bail!("No achievement data captured yet");
+        }
+
+        let list = self
+            .achievements
+            .iter()
+            // Status 0 is "invalid" (never touched); skip the noise.
+            .filter(|achievement| achievement.status != 0)
+            .map(|achievement| UiafItem {
+                id: achievement.id,
+                timestamp: achievement.finish_timestamp.unwrap_or(0),
+                current: 0,
+                status: achievement.status,
+            })
+            .collect();
+
+        let uiaf = Uiaf {
+            info: UiafInfo {
+                export_app: "Irminsul".to_string(),
+                export_app_version: env!("CARGO_PKG_VERSION").to_string(),
+                export_timestamp: Utc::now().timestamp(),
+                uiaf_version: "v1.1".to_string(),
+            },
+            list,
+        };
+
+        Ok(serde_json::to_string(&uiaf)?)
     }
 
     pub fn export_genshin_optimizer(&self, settings: &ExportSettings) -> Result<String> {
@@ -347,4 +409,29 @@ impl PlayerData {
             })
             .collect()
     }
+}
+
+#[derive(Serialize)]
+struct Uiaf {
+    info: UiafInfo,
+    list: Vec<UiafItem>,
+}
+
+#[derive(Serialize)]
+struct UiafInfo {
+    export_app: String,
+    export_app_version: String,
+    export_timestamp: i64,
+    uiaf_version: String,
+}
+
+#[derive(Serialize)]
+struct UiafItem {
+    id: u32,
+    /// Completion time as a unix timestamp (0 if unknown / not finished).
+    timestamp: u32,
+    /// Current progress toward the goal.  Irminsul doesn't capture this, so 0.
+    current: u32,
+    /// 0 invalid, 1 unfinished, 2 finished, 3 reward taken.
+    status: u32,
 }

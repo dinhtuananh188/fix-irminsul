@@ -12,11 +12,13 @@ use tracing_appender::rolling::Rotation;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 
+use crate::capture_health::CaptureHealth;
 use crate::player_data::ExportSettings;
 
 mod admin;
 mod app;
 mod capture;
+mod capture_health;
 mod good;
 mod monitor;
 mod player_data;
@@ -55,7 +57,9 @@ pub enum Message {
     DownloadAcknowledged,
     StartCapture,
     StopCapture,
+    SetCaptureBackend(capture::BackendType),
     ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
+    ExportAchievements(oneshot::Sender<Result<String>>),
 }
 
 #[derive(Clone, Debug)]
@@ -81,11 +85,24 @@ impl Default for DataUpdated {
     }
 }
 
+/// How many of each exportable thing the current capture has decoded.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DataCounts {
+    pub characters: u32,
+    pub artifacts: u32,
+    pub weapons: u32,
+    pub materials: u32,
+    pub achievements: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppState {
     state: State,
     capturing: bool,
     updated: DataUpdated,
+    counts: DataCounts,
+    /// Set when the capture backend itself failed to start (e.g. Npcap missing).
+    capture_error: Option<String>,
 }
 
 impl AppState {
@@ -94,6 +111,8 @@ impl AppState {
             state: State::Starting,
             capturing: false,
             updated: DataUpdated::new(),
+            counts: DataCounts::default(),
+            capture_error: None,
         }
     }
 }
@@ -161,7 +180,7 @@ impl ReloadHandle {
 }
 
 fn main() -> eframe::Result {
-    let (_guard, reload_handle) = tracing_init().unwrap();
+    let (_guard, reload_handle, capture_health) = tracing_init().unwrap();
 
     let args = Args::parse();
 
@@ -195,6 +214,7 @@ fn main() -> eframe::Result {
                 cc,
                 reload_handle,
                 capture_backend,
+                capture_health,
             )))
         }),
     )
@@ -213,7 +233,11 @@ fn open_log_dir() -> Result<()> {
     Ok(())
 }
 
-fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, ReloadHandle)> {
+fn tracing_init() -> Result<(
+    tracing_appender::non_blocking::WorkerGuard,
+    ReloadHandle,
+    CaptureHealth,
+)> {
     let appender = tracing_appender::rolling::Builder::new()
         .filename_prefix("log")
         .rotation(Rotation::DAILY)
@@ -226,11 +250,13 @@ fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, Reload
     let writer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking_appender)
         .with_ansi(false);
+    let capture_health = CaptureHealth::default();
     tracing_subscriber::registry()
         .with(filter)
         .with(writer)
+        .with(capture_health.layer())
         .init();
     tracing::info!("Tracing initialized and logging to file.");
 
-    Ok((guard, ReloadHandle(reload_handle)))
+    Ok((guard, ReloadHandle(reload_handle), capture_health))
 }

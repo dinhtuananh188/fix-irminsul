@@ -9,6 +9,7 @@ use std::fmt::{Debug, Display};
 use anyhow::Error;
 use async_trait::async_trait;
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 
 pub const PORT_RANGE: (u16, u16) = (22101, 22102);
 
@@ -46,11 +47,20 @@ pub trait CaptureBackend: Send {
     async fn next_packet(&mut self) -> Result<Vec<u8>>;
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[allow(unused)]
 pub enum BackendType {
     Pktmon,
     Pcap,
+}
+
+impl Display for BackendType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendType::Pktmon => write!(f, "pktmon (built-in, no driver)"),
+            BackendType::Pcap => write!(f, "pcap (Npcap/libpcap, more reliable)"),
+        }
+    }
 }
 
 #[cfg(windows)]

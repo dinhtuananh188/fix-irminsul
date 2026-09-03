@@ -4,7 +4,7 @@ use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use anime_game_data::AnimeGameData;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use auto_artifactarium::{
     GameCommand, GamePacket, GameSniffer, matches_achievement_packet, matches_avatar_packet,
     matches_item_packet,
@@ -17,7 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capture::{BackendType, create_capture};
 use crate::player_data::PlayerData;
-use crate::{APP_ID, AppState, DataUpdated, Message, State};
+use crate::{APP_ID, AppState, DataCounts, DataUpdated, Message, State};
+
+/// Events reported back from a spawned [`capture_task`].
+enum CaptureEvent {
+    /// The capture backend could not be started (e.g. Npcap not installed).
+    Failed(String),
+}
 
 struct AppStateManager {
     app_state: AppState,
@@ -46,6 +52,16 @@ impl AppStateManager {
         self.app_state.updated = updated;
         let _ = self.state_tx.send(self.app_state.clone());
     }
+
+    pub fn update_counts(&mut self, counts: DataCounts) {
+        self.app_state.counts = counts;
+        let _ = self.state_tx.send(self.app_state.clone());
+    }
+
+    pub fn set_capture_error(&mut self, error: Option<String>) {
+        self.app_state.capture_error = error;
+        let _ = self.state_tx.send(self.app_state.clone());
+    }
 }
 
 pub struct Monitor {
@@ -57,6 +73,8 @@ pub struct Monitor {
     capture_cancel_token: Option<CancellationToken>,
     packet_tx: mpsc::UnboundedSender<Vec<u8>>,
     packet_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_event_tx: mpsc::UnboundedSender<CaptureEvent>,
+    capture_event_rx: mpsc::UnboundedReceiver<CaptureEvent>,
     capture_backend: BackendType,
 }
 
@@ -73,6 +91,7 @@ impl Monitor {
         let keys = load_keys()?;
         let sniffer = GameSniffer::new().set_initial_keys(keys);
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
+        let (capture_event_tx, capture_event_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             app_state,
@@ -83,6 +102,8 @@ impl Monitor {
             capture_cancel_token: None,
             packet_tx,
             packet_rx,
+            capture_event_tx,
+            capture_event_rx,
             capture_backend,
         })
     }
@@ -95,7 +116,19 @@ impl Monitor {
                 tokio::select! {
                     Some(packet) = self.packet_rx.recv() => self.handle_packet(packet),
                     Some(msg) = self.ui_message_rx.recv() => self.handle_ui_msg(msg),
+                    Some(event) = self.capture_event_rx.recv() => self.handle_capture_event(event),
                 }
+        }
+    }
+
+    fn handle_capture_event(&mut self, event: CaptureEvent) {
+        match event {
+            CaptureEvent::Failed(error) => {
+                tracing::error!("Capture backend failed: {error}");
+                self.capture_cancel_token = None;
+                self.app_state.update_capturing_state(false);
+                self.app_state.set_capture_error(Some(error));
+            }
         }
     }
 
@@ -106,12 +139,16 @@ impl Monitor {
                     tracing::warn!("Capture start request with an existing cancel token");
                 }
 
+                // Clear any error from a previous attempt.
+                self.app_state.set_capture_error(None);
+
                 // Spawn capture task.
                 let cancel_token = CancellationToken::new();
                 tokio::spawn(capture_task(
                     cancel_token.clone(),
                     self.packet_tx.clone(),
                     self.capture_backend,
+                    self.capture_event_tx.clone(),
                 ));
                 self.capture_cancel_token = Some(cancel_token);
                 self.app_state.update_capturing_state(true);
@@ -124,8 +161,19 @@ impl Monitor {
                 cancel_token.cancel();
                 self.app_state.update_capturing_state(false);
             }
+            Message::SetCaptureBackend(backend) => {
+                if self.capture_backend != backend {
+                    tracing::info!("Switching capture backend to {backend:?}");
+                    self.capture_backend = backend;
+                }
+                // The running capture task, if any, keeps using the old backend
+                // until the UI stops and restarts it.
+            }
             Message::ExportGenshinOptimizer(settings, reply_tx) => {
                 let _ = reply_tx.send(self.player_data.export_genshin_optimizer(&settings));
+            }
+            Message::ExportAchievements(reply_tx) => {
+                let _ = reply_tx.send(self.player_data.export_uiaf());
             }
             _ => (),
         }
@@ -172,6 +220,7 @@ impl Monitor {
 
         if has_new_data {
             self.app_state.update_timestamps(updated);
+            self.app_state.update_counts(self.player_data.counts());
         }
     }
 }
@@ -193,9 +242,22 @@ async fn capture_task(
     cancel_token: CancellationToken,
     packet_tx: mpsc::UnboundedSender<Vec<u8>>,
     backend: BackendType,
+    event_tx: mpsc::UnboundedSender<CaptureEvent>,
 ) -> Result<()> {
-    let mut capture = create_capture(backend)
-        .map_err(|e| anyhow!("Error creating packet capture using {:?}: {e}", backend))?;
+    let mut capture = match create_capture(backend) {
+        Ok(capture) => capture,
+        Err(e) => {
+            let message = match backend {
+                BackendType::Pcap => format!(
+                    "Couldn't start pcap capture ({e}). Is Npcap installed? \
+                     Try the pktmon backend in settings."
+                ),
+                BackendType::Pktmon => format!("Couldn't start pktmon capture: {e}"),
+            };
+            let _ = event_tx.send(CaptureEvent::Failed(message));
+            return Ok(());
+        }
+    };
     tracing::info!("starting capture");
     loop {
         let packet = tokio::select!(

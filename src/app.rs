@@ -16,6 +16,7 @@ use egui_notify::Toasts;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::capture_health::CaptureHealth;
 use crate::monitor::Monitor;
 use crate::player_data::ExportSettings;
 use crate::update::check_for_app_update;
@@ -32,6 +33,14 @@ pub struct SavedAppState {
     log_raw_packets: bool,
     #[serde(default)]
     tracing_level: TracingLevel,
+    /// Persisted capture backend override.  `None` means "use the command-line
+    /// value / platform default".
+    #[serde(default)]
+    capture_backend: Option<capture::BackendType>,
+    /// Path to the Genshin Impact game executable, so it can be launched from
+    /// the UI (which also guarantees capture is running first).
+    #[serde(default)]
+    genshin_exe: Option<PathBuf>,
 }
 
 impl Default for SavedAppState {
@@ -56,6 +65,8 @@ impl Default for SavedAppState {
             auto_start_capture: false,
             log_raw_packets: false,
             tracing_level: Default::default(),
+            capture_backend: None,
+            genshin_exe: None,
         }
     }
 }
@@ -87,7 +98,17 @@ pub struct IrminsulApp {
     optimizer_save_path: Option<PathBuf>,
     optimizer_export_target: OptimizerExportTarget,
 
+    achievement_export_rx: Option<oneshot::Receiver<Result<String>>>,
+    achievement_save_dialog: Option<FileDialog>,
+    achievement_save_path: Option<PathBuf>,
+    achievement_export_target: OptimizerExportTarget,
+
     restarting: bool,
+
+    capture_health: CaptureHealth,
+
+    /// Directory picker for locating the Genshin Impact install.
+    genshin_dir_dialog: Option<FileDialog>,
 
     saved_state: SavedAppState,
 }
@@ -181,15 +202,21 @@ impl IrminsulApp {
         cc: &eframe::CreationContext<'_>,
         mut tracing_reload_handle: ReloadHandle,
         capture_backend: capture::BackendType,
+        capture_health: CaptureHealth,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
-        let saved_state: SavedAppState = if let Some(storage) = cc.storage {
+        let mut saved_state: SavedAppState = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
         } else {
             Default::default()
         };
+
+        // A persisted backend choice wins over the command-line default; a
+        // command-line value with nothing saved yet becomes the saved default.
+        let capture_backend = saved_state.capture_backend.unwrap_or(capture_backend);
+        saved_state.capture_backend = Some(capture_backend);
 
         tracing_reload_handle.set_filter(saved_state.tracing_level.get_filter());
         let (log_packets_tx, log_packets_rx) = watch::channel(saved_state.log_raw_packets);
@@ -197,6 +224,7 @@ impl IrminsulApp {
             start_async_runtime(cc.egui_ctx.clone(), log_packets_rx, capture_backend);
 
         if saved_state.auto_start_capture {
+            capture_health.reset();
             if let Err(e) = ui_message_tx.send(Message::StartCapture) {
                 tracing::error!("Failed to send auto start message: {e}");
             }
@@ -218,9 +246,68 @@ impl IrminsulApp {
             optimizer_save_dialog: None,
             optimizer_save_path: None,
             optimizer_export_target: OptimizerExportTarget::None,
+            achievement_export_rx: None,
+            achievement_save_dialog: None,
+            achievement_save_path: None,
+            achievement_export_target: OptimizerExportTarget::None,
             restarting: false,
+            capture_health,
+            genshin_dir_dialog: None,
             state_rx,
             wish_url_rx,
+        }
+    }
+
+    /// Send a start-capture request, resetting the capture-health counters so
+    /// the "dropping packets" warning reflects only the new session.
+    fn start_capture(&self) {
+        self.capture_health.reset();
+        let _ = self.ui_message_tx.send(Message::StartCapture);
+    }
+
+    /// Locate `GenshinImpact.exe` given a path the user picked, which may be the
+    /// executable itself or a directory containing it.
+    fn resolve_genshin_exe(picked: &std::path::Path) -> Option<PathBuf> {
+        if picked.is_file() {
+            return Some(picked.to_path_buf());
+        }
+        for name in ["GenshinImpact.exe", "YuanShen.exe"] {
+            let candidate = picked.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Start capture (if not already running) and launch the game.
+    fn launch_genshin(&mut self) {
+        let Some(exe) = self.saved_state.genshin_exe.clone() else {
+            self.toasts.error("Set the Genshin Impact folder first");
+            return;
+        };
+        if !exe.is_file() {
+            self.toasts.error(format!("Not found: {}", exe.display()));
+            return;
+        }
+
+        if !self.state_rx.borrow().capturing {
+            self.start_capture();
+        }
+
+        let dir = exe.parent().map(PathBuf::from);
+        let mut command = std::process::Command::new(&exe);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        match command.spawn() {
+            Ok(_) => {
+                self.toasts
+                    .info("Launching Genshin Impact — log in to capture your data");
+            }
+            Err(e) => {
+                self.toasts.error(format!("Couldn't launch Genshin: {e}"));
+            }
         }
     }
 }
@@ -241,6 +328,12 @@ impl eframe::App for IrminsulApp {
         self.toasts.show(ctx);
         if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog {
             optimizer_save_dialog.update(ctx);
+        }
+        if let Some(genshin_dir_dialog) = &mut self.genshin_dir_dialog {
+            genshin_dir_dialog.update(ctx);
+        }
+        if let Some(achievement_save_dialog) = &mut self.achievement_save_dialog {
+            achievement_save_dialog.update(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -553,23 +646,143 @@ impl IrminsulApp {
                         .button(egui_material_icons::icons::ICON_PLAY_ARROW)
                         .clicked()
                     {
-                        let _ = self.ui_message_tx.send(Message::StartCapture);
+                        self.start_capture();
                     }
                 },
             );
         });
+        let counts = app_state.counts;
         egui::Grid::new("capture_stats")
             .striped(false)
-            .num_columns(2)
+            .num_columns(3)
             .min_col_width(0.)
             .show(ui, |ui| {
-                Self::data_state(ui, "Items", app_state.updated.items_updated);
-                Self::data_state(ui, "Characters", app_state.updated.characters_updated);
-                Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
+                Self::data_state(
+                    ui,
+                    "Characters",
+                    app_state.updated.characters_updated,
+                    Some(counts.characters),
+                );
+                Self::data_state(
+                    ui,
+                    "Artifacts",
+                    app_state.updated.items_updated,
+                    Some(counts.artifacts),
+                );
+                Self::data_state(
+                    ui,
+                    "Weapons",
+                    app_state.updated.items_updated,
+                    Some(counts.weapons),
+                );
+                Self::data_state(
+                    ui,
+                    "Achievements",
+                    app_state.updated.achievements_updated,
+                    Some(counts.achievements),
+                );
             });
+
+        // Surface a hard capture failure (e.g. Npcap missing) prominently.
+        if let Some(error) = &app_state.capture_error {
+            ui.add_space(4.0);
+            ui.colored_label(
+                Color32::from_rgb(0xE0, 0x4A, 0x4A),
+                format!("{}  {error}", egui_material_icons::icons::ICON_ERROR),
+            );
+        }
+
+        // Warn when the backend is running but not decoding anything: the game
+        // was likely already logged in when capture started, so the login data
+        // dump was missed.
+        if app_state.capturing
+            && app_state.capture_error.is_none()
+            && counts.characters == 0
+            && counts.artifacts == 0
+            && counts.achievements == 0
+        {
+            ui.add_space(4.0);
+            ui.colored_label(
+                Color32::from_rgb(0xE5, 0x7C, 0x00),
+                format!(
+                    "{}  Capturing… log in to Genshin now. If you were already \
+                     in-game, fully quit and relaunch it.",
+                    egui_material_icons::icons::ICON_INFO,
+                ),
+            );
+        }
+
+        // Warn when the capture backend is losing packets: the passive sniffer
+        // can't recover dropped KCP segments, so the login data won't decode.
+        if self.capture_health.is_lossy() {
+            ui.add_space(4.0);
+            ui.colored_label(
+                Color32::from_rgb(0xE5, 0x7C, 0x00),
+                format!(
+                    "{}  Capture is dropping packets ({} events). Data may be \
+                     incomplete — switch the capture backend to pcap in \
+                     settings, then recapture.",
+                    egui_material_icons::icons::ICON_WARNING,
+                    self.capture_health.drop_events(),
+                ),
+            );
+        }
+
+        // One-click: make sure capture is running, then launch the game.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!(
+                    "{}  Launch Genshin",
+                    egui_material_icons::icons::ICON_ROCKET_LAUNCH
+                ))
+                .on_hover_text("Starts capture (if needed), then launches the game")
+                .clicked()
+            {
+                self.launch_genshin();
+            }
+            if ui
+                .button(egui_material_icons::icons::ICON_FOLDER_OPEN)
+                .on_hover_text(match &self.saved_state.genshin_exe {
+                    Some(p) => p.display().to_string(),
+                    None => "Choose the Genshin Impact game folder".to_string(),
+                })
+                .clicked()
+            {
+                let mut dialog = FileDialog::new();
+                if let Some(exe) = &self.saved_state.genshin_exe
+                    && let Some(dir) = exe.parent()
+                {
+                    dialog = dialog.initial_directory(dir.to_path_buf());
+                }
+                dialog.pick_directory();
+                self.genshin_dir_dialog = Some(dialog);
+            }
+        });
+
+        if let Some(dialog) = &mut self.genshin_dir_dialog
+            && let Some(picked) = dialog.take_picked()
+        {
+            match Self::resolve_genshin_exe(&picked) {
+                Some(exe) => {
+                    self.toasts.info(format!("Genshin: {}", exe.display()));
+                    self.saved_state.genshin_exe = Some(exe);
+                }
+                None => {
+                    self.toasts
+                        .error("No GenshinImpact.exe / YuanShen.exe in that folder");
+                }
+            }
+            self.genshin_dir_dialog = None;
+        }
     }
 
-    fn data_state(ui: &mut egui::Ui, source: &str, last_updated: Option<Instant>) {
+    fn data_state(
+        ui: &mut egui::Ui,
+        source: &str,
+        last_updated: Option<Instant>,
+        count: Option<u32>,
+    ) {
         let updated_icon = match last_updated {
             Some(_) => RichText::new(egui_material_icons::icons::ICON_CHECK_CIRCLE)
                 .color(Color32::from_hex("#00ab3f").unwrap()),
@@ -577,6 +790,14 @@ impl IrminsulApp {
         };
         ui.label(updated_icon);
         ui.label(source);
+        match count {
+            Some(count) if last_updated.is_some() => {
+                ui.label(RichText::new(count.to_string()).weak());
+            }
+            _ => {
+                ui.label("");
+            }
+        }
         ui.end_row();
     }
 
@@ -758,13 +979,78 @@ impl IrminsulApp {
     }
 
     fn capture_settings_modal(&mut self, ui: &mut egui::Ui) {
-        ui.set_width(300.0);
-        ui.heading("Genshin Optimizer Settings");
+        ui.set_width(320.0);
+        ui.heading("Capture Settings");
         ui.separator();
         ui.checkbox(
             &mut self.saved_state.auto_start_capture,
             "Start capture on Irminsul launch",
         );
+
+        ui.separator();
+        let current = self
+            .saved_state
+            .capture_backend
+            .unwrap_or(capture::DEFAULT_CAPTURE_BACKEND_TYPE);
+        let mut selected = current;
+        egui::ComboBox::from_label("Capture backend")
+            .selected_text(selected.to_string())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut selected,
+                    capture::BackendType::Pktmon,
+                    capture::BackendType::Pktmon.to_string(),
+                );
+                ui.selectable_value(
+                    &mut selected,
+                    capture::BackendType::Pcap,
+                    capture::BackendType::Pcap.to_string(),
+                );
+            });
+        if selected != current {
+            self.saved_state.capture_backend = Some(selected);
+            let _ = self
+                .ui_message_tx
+                .send(Message::SetCaptureBackend(selected));
+            // Re-arm the capture with the new backend if one is running.
+            if self.state_rx.borrow().capturing {
+                let _ = self.ui_message_tx.send(Message::StopCapture);
+                self.start_capture();
+                self.toasts.info("Capture restarted with the new backend");
+            }
+        }
+        ui.label(
+            egui::RichText::new(
+                "pcap needs Npcap installed but survives Genshin's login burst; \
+                 pktmon drops packets on some systems.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.separator();
+        ui.label("Genshin Impact folder");
+        ui.horizontal(|ui| {
+            let label = match &self.saved_state.genshin_exe {
+                Some(p) => p.display().to_string(),
+                None => "(not set)".to_string(),
+            };
+            if ui
+                .button(egui_material_icons::icons::ICON_FOLDER_OPEN)
+                .clicked()
+            {
+                let mut dialog = FileDialog::new();
+                if let Some(exe) = &self.saved_state.genshin_exe
+                    && let Some(dir) = exe.parent()
+                {
+                    dialog = dialog.initial_directory(dir.to_path_buf());
+                }
+                dialog.pick_directory();
+                self.genshin_dir_dialog = Some(dialog);
+            }
+            ui.add(egui::Label::new(egui::RichText::new(label).small()).truncate());
+        });
+
         ui.separator();
         egui::Sides::new().show(
             ui,
@@ -941,9 +1227,93 @@ impl IrminsulApp {
         Ok(())
     }
 
-    fn achievement_ui(&self, ui: &mut egui::Ui, _app_state: &AppState) {
-        Self::section_header(ui, "Achievement Export");
-        ui.label("coming soon".to_string());
+    fn achievement_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        self.achievement_handle_export(ui).toast_error(self);
+
+        ui.vertical(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    Self::section_header(ui, "Achievement Export");
+                    ui.label(egui_material_icons::icons::ICON_HELP)
+                        .on_hover_text(
+                            "Exports the UIAF format used by Snap Hutao, cocogoat and paimon.moe.",
+                        );
+                },
+                |ui| {
+                    ui.add_enabled_ui(
+                        app_state.updated.achievements_updated.is_some()
+                            && self.achievement_export_rx.is_none(),
+                        |ui| {
+                            if ui
+                                .button(egui_material_icons::icons::ICON_DOWNLOAD)
+                                .clicked()
+                            {
+                                let now = Local::now();
+                                let mut dialog = FileDialog::new()
+                                    .add_file_filter_extensions("JSON files", vec!["json"])
+                                    .default_file_name(&format!(
+                                        "achievements_uiaf_{}.json",
+                                        now.format("%Y-%m-%d_%H-%M")
+                                    ));
+                                dialog.save_file();
+                                self.achievement_save_dialog = Some(dialog);
+                            }
+
+                            if let Some(dialog) = &mut self.achievement_save_dialog
+                                && let Some(path) = dialog.take_picked()
+                            {
+                                self.achievement_save_path = Some(path);
+                                self.achievement_request_export(OptimizerExportTarget::File);
+                            }
+
+                            if ui
+                                .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                                .clicked()
+                            {
+                                self.achievement_request_export(OptimizerExportTarget::Clipboard);
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    fn achievement_request_export(&mut self, target: OptimizerExportTarget) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
+        self.achievement_export_target = target;
+        self.achievement_export_rx = Some(rx);
+    }
+
+    fn achievement_handle_export(&mut self, ui: &mut egui::Ui) -> Result<()> {
+        let Some(rx) = self.achievement_export_rx.take() else {
+            return Ok(());
+        };
+
+        let json = rx.blocking_recv()??;
+
+        match self.achievement_export_target {
+            OptimizerExportTarget::None => tracing::warn!("Unexpected achievement export"),
+            OptimizerExportTarget::Clipboard => {
+                ui.ctx().copy_text(json);
+                self.toasts.info("Achievements copied to clipboard (UIAF)");
+            }
+            OptimizerExportTarget::File => {
+                let path = self
+                    .achievement_save_path
+                    .take()
+                    .ok_or_else(|| anyhow!("No save file path set"))?;
+                let file =
+                    File::create(&path).with_context(|| format!("Unable to open file {path:?}"))?;
+                BufWriter::new(file).write_all(json.as_bytes())?;
+                self.toasts.info("Achievements saved to file (UIAF)");
+            }
+        }
+
+        self.achievement_export_target = OptimizerExportTarget::None;
+        Ok(())
     }
 
     fn section_header(ui: &mut egui::Ui, name: &str) {

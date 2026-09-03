@@ -1,2 +1,5 @@
 /target
 /docs/book
+
+# local machine build config
+.cargo/config.toml
