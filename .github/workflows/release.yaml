@@ -161,6 +161,7 @@ jobs:
           path: target/release/irminsul-macos-arm64
 
   # Create the release:
+  # Create the release:
   # * Push release commit to both main and the release tag
   # * Create a new github release on the release tag
   create-release:
