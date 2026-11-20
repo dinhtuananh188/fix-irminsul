@@ -171,6 +171,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history so pushing the bump commit to main is a recognised
+          # fast-forward.
+          fetch-depth: 0
       - uses: actions/download-artifact@v7
         with:
           name: bump-bundle
